@@ -1,0 +1,85 @@
+#pragma once
+
+#include <Geode/cocos/CCDirector.h>
+#include <algorithm>
+#include <cstdint>
+#include <chrono>
+
+namespace paimon::framebudget {
+
+// per-frame microsecond budget for main-thread thumbnail/LevelCell work.
+// unused capacity carries no state forward.
+#if defined(GEODE_IS_ANDROID) || defined(GEODE_IS_IOS)
+inline constexpr int64_t kFrameBudgetUs = 900;
+#else
+inline constexpr int64_t kFrameBudgetUs = 2000;
+#endif
+
+// each stage has a reserved slice plus unused shared capacity.
+enum class Stage : int {
+    Upload = 0,
+    Callback,
+    GifFrame,
+    Count
+};
+
+inline constexpr int kStageCount = static_cast<int>(Stage::Count);
+
+// reservations sum below 100%; the remainder is shared.
+inline constexpr int kStageReservePct[kStageCount] = { 30, 30, 10 };
+
+inline int64_t& usedUsRef() { static int64_t v = 0; return v; }
+inline int64_t& frameKeyRef() { static int64_t v = -1; return v; }
+inline int64_t* stageUsedUs() { static int64_t v[kStageCount] = {}; return v; }
+
+inline void refresh() {
+    auto* dir = cocos2d::CCDirector::sharedDirector();
+    int64_t visual = dir ? static_cast<int64_t>(dir->getTotalFrames()) : 0;
+    if (visual != frameKeyRef()) {
+        frameKeyRef() = visual;
+        usedUsRef() = 0;
+        auto* staged = stageUsedUs();
+        for (int i = 0; i < kStageCount; ++i) staged[i] = 0;
+    }
+}
+
+inline constexpr int64_t stageReserveUs(Stage stage) {
+    return kFrameBudgetUs * kStageReservePct[static_cast<int>(stage)] / 100;
+}
+
+// microseconds left this frame; callers use it as a busy signal.
+inline int64_t remainingUs() {
+    refresh();
+    return std::max<int64_t>(0, kFrameBudgetUs - usedUsRef());
+}
+
+inline int64_t remainingUs(Stage stage) {
+    refresh();
+    auto const* staged = stageUsedUs();
+    int const idx = static_cast<int>(stage);
+
+    int64_t const ownUnused = std::max<int64_t>(0, stageReserveUs(stage) - staged[idx]);
+
+    int64_t othersUnused = 0;
+    for (int i = 0; i < kStageCount; ++i) {
+        if (i == idx) continue;
+        othersUnused += std::max<int64_t>(
+            0, stageReserveUs(static_cast<Stage>(i)) - staged[i]);
+    }
+
+    int64_t const globalLeft = std::max<int64_t>(0, kFrameBudgetUs - usedUsRef());
+    return std::max<int64_t>(ownUnused, globalLeft - othersUnused);
+}
+
+inline bool hasBudget() {
+    return remainingUs() > 0;
+}
+
+inline void consume(Stage stage, int64_t us) {
+    refresh();
+    if (us <= 0) return;
+    usedUsRef() += us;
+    stageUsedUs()[static_cast<int>(stage)] += us;
+}
+
+}

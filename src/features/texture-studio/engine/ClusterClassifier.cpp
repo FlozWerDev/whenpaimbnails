@@ -1,0 +1,298 @@
+#include "ClusterClassifier.hpp"
+
+#include "../../colorful-icons/services/IconColorMath.hpp"
+
+#include <algorithm>
+#include <cmath>
+
+namespace paimon::texture_studio {
+
+namespace {
+
+constexpr float kFarAway = 1.0e30f;
+
+float pixelToClusterDist(float h, float s, float v, ColorCluster const& c) {
+    return ColorClustering::hsvDistance(h, s, v, c.h, c.s, c.v);
+}
+
+int nearestCluster(float h, float s, float v,
+                   ColorCluster const* clusters, int n) {
+    int best = 0;
+    float bestD = kFarAway;
+    for (int i = 0; i < n; ++i) {
+        float d = pixelToClusterDist(h, s, v, clusters[i]);
+        if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+}
+
+// Single shared pass, values identical to per-cluster passes.
+std::vector<float> computeAllBorderRatios(ImageBuffer const& sprite,
+                                          ColorCluster const* allClusters,
+                                          int clusterCount) {
+    std::vector<float> ratios;
+    ratios.assign(static_cast<std::size_t>(std::max(0, clusterCount)), 0.0f);
+    if (sprite.empty() || !allClusters || clusterCount <= 0) return ratios;
+
+    int W = sprite.width();
+    int H = sprite.height();
+    constexpr int kAlphaCutoff = 16;
+
+    std::vector<int> inCluster(static_cast<std::size_t>(clusterCount), 0);
+    std::vector<int> onBorder(static_cast<std::size_t>(clusterCount), 0);
+
+    auto isTransparent = [&](int x, int y) {
+        if (x < 0 || y < 0 || x >= W || y >= H) return true;
+        auto const* p = sprite.atRef(x, y);
+        return p[3] < kAlphaCutoff;
+    };
+
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            auto const* p = sprite.atRef(x, y);
+            if (p[3] < kAlphaCutoff) continue;
+            auto hsv = paimon::icons::math::toHSV(cocos2d::ccColor3B{p[0], p[1], p[2]});
+            int idx = nearestCluster(hsv.h, hsv.s, hsv.v, allClusters, clusterCount);
+            if (idx < 0 || idx >= clusterCount) continue;
+            ++inCluster[static_cast<std::size_t>(idx)];
+            if (isTransparent(x - 1, y) || isTransparent(x + 1, y) ||
+                isTransparent(x, y - 1) || isTransparent(x, y + 1)) {
+                ++onBorder[static_cast<std::size_t>(idx)];
+            }
+        }
+    }
+
+    for (int i = 0; i < clusterCount; ++i) {
+        std::size_t k = static_cast<std::size_t>(i);
+        if (allClusters[i].pixelCount == 0 || inCluster[k] == 0) {
+            ratios[k] = 0.0f;
+        } else {
+            ratios[k] = static_cast<float>(onBorder[k]) /
+                        static_cast<float>(inCluster[k]);
+        }
+    }
+    return ratios;
+}
+
+}  // anonymous namespace
+
+float ClusterClassifier::computeBorderRatio(ImageBuffer const& sprite,
+                                            ColorCluster const& cluster,
+                                            ColorCluster const* allClusters,
+                                            int clusterCount,
+                                            int targetIndex) {
+    if (sprite.empty() || cluster.pixelCount == 0 || clusterCount <= 0 || !allClusters) {
+        return 0.0f;
+    }
+    if (targetIndex < 0 || targetIndex >= clusterCount) return 0.0f;
+    return computeAllBorderRatios(sprite, allClusters, clusterCount)[
+        static_cast<std::size_t>(targetIndex)];
+}
+
+ClassifiedSet ClusterClassifier::classify(ClusterSet const& set, ImageBuffer const& sprite) {
+    ClassifiedSet out;
+    if (set.clusters.empty()) {
+        out.needsReview = true;
+        return out;
+    }
+
+    // Step 1: single shared border-ratio pass.
+    int n = static_cast<int>(set.clusters.size());
+    auto ratios = computeAllBorderRatios(sprite, set.clusters.data(), n);
+    out.clusters.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        ClassifiedCluster c;
+        c.source = set.clusters[i];
+        c.source.borderRatio = ratios[static_cast<std::size_t>(i)];
+        c.role = ClusterRole::Unassigned;
+        out.clusters.push_back(c);
+    }
+
+    int totalAssignablePixels = 0;
+    for (auto const& c : out.clusters) totalAssignablePixels += c.source.pixelCount;
+    if (totalAssignablePixels <= 0) {
+        out.needsReview = true;
+        return out;
+    }
+
+    // Weighted median: thresholds follow asset exposure.
+    std::vector<std::pair<float, int>> values;
+    values.reserve(out.clusters.size());
+    for (auto const& c : out.clusters) {
+        values.emplace_back(c.source.v, c.source.pixelCount);
+    }
+    std::sort(values.begin(), values.end());
+    int accumulated = 0;
+    float medianV = values.back().first;
+    for (auto const& [value, count] : values) {
+        accumulated += count;
+        if (accumulated * 2 >= totalAssignablePixels) {
+            medianV = value;
+            break;
+        }
+    }
+    float outlineV = std::clamp(medianV * 0.42f, 0.12f, 0.30f);
+
+    auto shareOf = [&](ColorCluster const& c) {
+        return static_cast<float>(c.pixelCount) /
+               static_cast<float>(totalAssignablePixels);
+    };
+    float glowFloor = std::max(0.78f, medianV * 1.05f);
+    float darkRef   = std::max(outlineV * 1.5f, 1.0e-3f);
+    float brightRef = std::max(1.0f - glowFloor, 1.0e-3f);
+
+    std::vector<float> outlineScore(n, 0.0f);
+    std::vector<float> glowScore(n, 0.0f);
+    for (int i = 0; i < n; ++i) {
+        auto const& c = out.clusters[i].source;
+        float v      = std::clamp(c.v, 0.0f, 1.0f);
+        float s      = std::clamp(c.s, 0.0f, 1.0f);
+        float border = std::clamp(c.borderRatio, 0.0f, 1.0f);
+        float sh     = shareOf(c);
+        float darkness   = std::clamp((darkRef - v) / darkRef, 0.0f, 1.0f);
+        float brightness = std::clamp((v - glowFloor) / brightRef, 0.0f, 1.0f);
+
+        // Outline must touch the silhouette or dark interior Color2 gets eaten.
+        outlineScore[i] = (border > 0.02f)
+            ? 0.50f * darkness + 0.35f * (1.0f - s) + 0.15f * border
+            : 0.0f;
+        glowScore[i] = (v > glowFloor)
+            ? 0.45f * brightness + 0.25f * border + 0.20f * (1.0f - s)
+              + 0.10f * (1.0f - sh)
+            : 0.0f;
+    }
+
+    // Step 2a: outline (multiple ok); all-dark sprite keeps only the darkest for Color1.
+    constexpr float kOutlineBar = 0.45f;
+    int outlineCount = 0;
+    int darkestIdx = -1;
+    for (int i = 0; i < n; ++i) {
+        if (outlineScore[i] < kOutlineBar) continue;
+        out.clusters[i].role = ClusterRole::Outline;
+        out.clusters[i].confidence = std::clamp(outlineScore[i], 0.0f, 1.0f);
+        ++outlineCount;
+        if (darkestIdx < 0 ||
+            out.clusters[i].source.v < out.clusters[darkestIdx].source.v) {
+            darkestIdx = i;
+        }
+    }
+    if (outlineCount == n && n > 1 && darkestIdx >= 0) {
+        for (int i = 0; i < n; ++i) {
+            if (i != darkestIdx) {
+                out.clusters[i].role = ClusterRole::Unassigned;
+                out.clusters[i].confidence = 0.0f;
+            }
+        }
+    }
+
+    // Step 3: Glow (at most one) — highest glow score above the bar.
+    constexpr float kGlowBar = 0.42f;
+    int glowIdx = -1;
+    for (int i = 0; i < n; ++i) {
+        if (out.clusters[i].role != ClusterRole::Unassigned) continue;
+        if (glowScore[i] < kGlowBar) continue;
+        if (glowIdx < 0 || glowScore[i] > glowScore[glowIdx]) glowIdx = i;
+    }
+    if (glowIdx >= 0) {
+        out.clusters[glowIdx].role = ClusterRole::Glow;
+        out.clusters[glowIdx].confidence = std::clamp(glowScore[glowIdx], 0.0f, 1.0f);
+    }
+
+    // Step 4: Color 1 (primary) — most salient remaining cluster.
+    int c1Idx = -1;
+    float c1Score = -1.0f;
+    for (int i = 0; i < n; ++i) {
+        if (out.clusters[i].role != ClusterRole::Unassigned) continue;
+        auto const& c = out.clusters[i].source;
+        // 0.4 floor: zero-saturation clusters (flat-grey logos) still count.
+        float satFactor = 0.4f + 0.6f * std::clamp(c.s, 0.0f, 1.0f);
+        float score = static_cast<float>(c.pixelCount) * satFactor;
+        if (score > c1Score) {
+            c1Score = score;
+            c1Idx = i;
+        }
+    }
+    if (c1Idx >= 0) {
+        out.clusters[c1Idx].role = ClusterRole::Color1;
+        out.clusters[c1Idx].confidence = 0.80f;
+    }
+
+    // Step 5: Color2 — hue-distant from Color1, else largest remaining.
+    int c2Idx = -1;
+    float c2Score = -1.0f;
+    if (c1Idx >= 0) {
+        auto const& c1 = out.clusters[c1Idx].source;
+        for (int i = 0; i < n; ++i) {
+            if (out.clusters[i].role != ClusterRole::Unassigned) continue;
+            auto const& c = out.clusters[i].source;
+            float dh = std::fabs(c.h - c1.h);
+            if (dh > 180.0f) dh = 360.0f - dh;
+            float hueWeight = dh / 180.0f;
+            hueWeight *= std::min(c.s, c1.s);
+            float score = static_cast<float>(c.pixelCount) * (0.5f + 0.5f * hueWeight);
+            if (score > c2Score) {
+                c2Score = score;
+                c2Idx = i;
+            }
+        }
+    } else {
+        for (int i = 0; i < n; ++i) {
+            if (out.clusters[i].role != ClusterRole::Unassigned) continue;
+            if (c2Idx == -1 ||
+                out.clusters[i].source.pixelCount > out.clusters[c2Idx].source.pixelCount) {
+                c2Idx = i;
+            }
+        }
+    }
+    if (c2Idx >= 0) {
+        out.clusters[c2Idx].role = ClusterRole::Color2;
+        out.clusters[c2Idx].confidence = 0.65f;
+    }
+
+    // Step 6: fold leftovers into the closest role by hue+value.
+    int leftover = 0;
+    auto roleHueDist = [&](int idx, ClusterRole role) -> float {
+        for (int j = 0; j < n; ++j) {
+            if (out.clusters[j].role == role) {
+                auto const& a = out.clusters[idx].source;
+                auto const& b = out.clusters[j].source;
+                return ColorClustering::hsvDistance(a.h, a.s, a.v, b.h, b.s, b.v);
+            }
+        }
+        return kFarAway;
+    };
+    for (int i = 0; i < n; ++i) {
+        if (out.clusters[i].role != ClusterRole::Unassigned) continue;
+        ClusterRole bestRole = ClusterRole::Color1;
+        float bestDist = roleHueDist(i, ClusterRole::Color1);
+        if (float d = roleHueDist(i, ClusterRole::Color2); d < bestDist) {
+            bestDist = d; bestRole = ClusterRole::Color2;
+        }
+        if (float d = roleHueDist(i, ClusterRole::Glow); d < bestDist) {
+            bestDist = d; bestRole = ClusterRole::Glow;
+        }
+        if (float d = roleHueDist(i, ClusterRole::Outline); d < bestDist) {
+            bestDist = d; bestRole = ClusterRole::Outline;
+        }
+        out.clusters[i].role = bestRole;
+        out.clusters[i].confidence = 0.40f;
+        ++leftover;
+    }
+
+    // Step 7: review when Color1 missing, mostly folded, or low confidence (flat icons lack outline+glow legitimately).
+    bool hasC1 = false;
+    float confidenceSum = 0.f;
+    for (auto const& c : out.clusters) {
+        if (c.role == ClusterRole::Color1)  hasC1 = true;
+        confidenceSum += c.confidence;
+    }
+    if (!hasC1) out.needsReview = true;
+    if (n > 1 && leftover * 2 > n) out.needsReview = true;
+    if (!out.clusters.empty() && confidenceSum / out.clusters.size() < 0.52f) {
+        out.needsReview = true;
+    }
+
+    return out;
+}
+
+}  // namespace paimon::texture_studio

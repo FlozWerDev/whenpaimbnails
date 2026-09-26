@@ -1,0 +1,59 @@
+// Texture Studio button on MenuLayer's bottom-menu; runs after geode.node-ids so the ID exists.
+
+#include <Geode/Geode.hpp>
+#include <Geode/modify/MenuLayer.hpp>
+
+#include "../ui/TextureStudioLayer.hpp"
+#include "../services/LiveSlotRuntime.hpp"
+#include "../../../framework/HookConventions.hpp"
+
+using namespace geode::prelude;
+
+namespace {
+
+constexpr auto kButtonID = "texture-studio-btn"_spr;
+
+bool textureStudioEnabled() {
+    return Mod::get()->getSettingValue<bool>("texture-studio-enabled");
+}
+
+}  // anonymous namespace
+
+class $modify(PaimonTextureStudioMenuHook, MenuLayer) {
+    static void onModify(auto& self) {
+        paimon::hooks::afterNodeIdsOrLate(self, "MenuLayer::init");
+    }
+
+    bool init() {
+        if (!MenuLayer::init()) return false;
+        paimon::texture_studio::LiveSlotRuntime::get().start();
+
+        if (!textureStudioEnabled()) return true;
+
+        auto* menu = this->getChildByID("bottom-menu");
+        if (!menu) {
+            menu = this->getChildByType<CCMenu>(0);
+        }
+        if (!menu) return true;
+
+        if (menu->getChildByID(kButtonID)) return true;
+
+        char const* iconName = "GJ_paintBtn_001.png";
+        if (!CCSpriteFrameCache::sharedSpriteFrameCache()->spriteFrameByName(iconName)) {
+            iconName = "GJ_optionsBtn_001.png";
+        }
+        auto* base = CircleButtonSprite::createWithSpriteFrameName(
+            iconName, 1.0f, CircleBaseColor::Pink, CircleBaseSize::Medium);
+        if (!base) return true;
+
+        auto* btn = CCMenuItemExt::createSpriteExtra(base,
+            [](CCMenuItemSpriteExtra*) {
+                paimon::texture_studio::TextureStudioLayer::open();
+            });
+        btn->setID(kButtonID);
+
+        menu->addChild(btn);
+        menu->updateLayout();
+        return true;
+    }
+};

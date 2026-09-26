@@ -1,0 +1,32 @@
+#pragma once
+
+#include <Geode/Geode.hpp>
+#include <Geode/binding/Slider.hpp>
+#include <functional>
+#include <string>
+
+class ClickEffectTunePopup : public geode::Popup {
+public:
+    // `onChange` gets (size, speed) per slider move; `onTest` previews behind.
+    static ClickEffectTunePopup* create(
+        std::string title, std::string desc,
+        float size, float speed,
+        std::function<void(float, float)> onChange,
+        std::function<void()> onTest);
+
+private:
+    std::function<void(float, float)> m_onChange;
+    std::function<void()> m_onTest;
+    std::string m_titleText;
+    std::string m_descText;
+    float m_size  = 1.f;
+    float m_speed = 1.f;
+
+    Slider* m_sizeSlider = nullptr;
+    Slider* m_speedSlider = nullptr;
+    cocos2d::CCLabelBMFont* m_sizeLabel = nullptr;
+    cocos2d::CCLabelBMFont* m_speedLabel = nullptr;
+
+    bool init() override;
+    void resetToDefault();
+};

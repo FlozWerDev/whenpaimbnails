@@ -1,0 +1,15 @@
+# Local builds and generated files
+/build*/
+/cmake/
+/geode/
+/_deps/
+/CPM_modules/
+/CMakeFiles/
+/CMakeCache.txt
+/cpm-package-lock.cmake
+/*.geode
+/installer/*.exe
+
+# Editor files
+/.idea/
+/.vscode/

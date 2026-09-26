@@ -1,0 +1,312 @@
+#include "WebRequestSource.hpp"
+
+#include "../../../core/RuntimeLifecycle.hpp"
+#include "../../../utils/AccountVerifier.hpp"
+#include "../../../utils/HttpClient.hpp"
+#include "../../../utils/MainThreadDelay.hpp"
+#include "../../../utils/WebHelper.hpp"
+
+#include <Geode/Geode.hpp>
+
+#include <cctype>
+#include <algorithm>
+#include <chrono>
+#include <climits>
+#include <optional>
+
+using namespace geode::prelude;
+
+namespace paimon::twitch {
+
+namespace {
+
+// one session per account: switching GD accounts must not reuse the old
+// token, and the legacy key (one for all) reads as fallback.
+constexpr char const* kLegacyTokenKey = "web-requests-host-token";
+
+std::string tokenKey(int accountID) {
+    return fmt::format("web-requests-host-token-{}", accountID);
+}
+
+// how the user reads in the URL: the server sends its own, this only keeps
+// something to show when the response comes up short.
+std::string slugify(std::string const& value) {
+    std::string slug;
+    for (unsigned char ch : value) {
+        if (std::isalnum(ch) || ch == '_') slug += static_cast<char>(std::tolower(ch));
+    }
+    return slug;
+}
+
+struct ServerTarget {
+    std::string host;
+    std::string path;
+};
+
+std::optional<ServerTarget> parseServer(std::string value) {
+    constexpr std::string_view scheme = "https://";
+    if (!value.starts_with(scheme)) return std::nullopt;
+    value.erase(0, scheme.size());
+    while (!value.empty() && value.back() == '/') value.pop_back();
+    auto slash = value.find('/');
+    ServerTarget target;
+    target.host = value.substr(0, slash);
+    if (slash != std::string::npos) target.path = value.substr(slash);
+    if (target.host.empty()) return std::nullopt;
+    return target;
+}
+
+} // namespace
+
+WebRequestSource::WebRequestSource(WebRequestCallbacks callbacks)
+  : m_callbacks(std::move(callbacks)) {}
+
+WebRequestSource::~WebRequestSource() {
+    stop();
+}
+
+bool WebRequestSource::supported() {
+#ifdef GEODE_IS_WINDOWS
+    return true;
+#else
+    return false;
+#endif
+}
+
+void WebRequestSource::start() {
+    if (m_stopped) return;
+    auto account = AccountVerifier::get().verify();
+    if (!account.loggedIn()) {
+        fail("Inicia sesion en Geometry Dash para tener tu pagina");
+        return;
+    }
+    m_accountID = account.accountID;
+    m_username = std::move(account.username);
+    m_slug = slugify(m_username);
+    if (m_slug.empty()) {
+        fail("Tu nombre de GD no sirve para una direccion web");
+        return;
+    }
+    m_serverBase = HttpClient::get().getServerURL();
+    if (m_callbacks.onStatus) m_callbacks.onStatus("Registrando tu pagina de requests...");
+    registerHost();
+}
+
+void WebRequestSource::stop() {
+    if (m_stopped) return;
+    m_stopped = true;
+    m_open = false;
+    m_life.reset();
+    if (m_socket) {
+        m_socket->disconnect();
+        m_socket.reset();
+    }
+}
+
+bool WebRequestSource::isOpen() const {
+    return m_open && m_socket && m_socket->isOpen();
+}
+
+bool WebRequestSource::sendFeedback(std::string const& requestID, int levelID,
+    std::string decision, int percent, std::string note, std::string reason,
+    std::string image, std::function<void(bool, std::string)> callback) {
+    auto token = savedToken();
+    if (m_stopped || m_slug.empty() || token.empty() || requestID.empty()) return false;
+    auto body = matjson::makeObject({
+        {"requestId", requestID}, {"levelId", levelID}, {"decision", decision},
+        {"percent", percent}, {"note", note}, {"reason", reason}, {"image", image}
+    });
+    web::WebRequest request;
+    request.header("Content-Type", "application/json")
+        .header("X-API-Key", HttpClient::get().getApiKey())
+        .header("X-Request-Host", m_slug)
+        .header("Authorization", "Bearer " + token)
+        .timeout(std::chrono::seconds(30))
+        .bodyString(body.dump(matjson::NO_INDENTATION));
+    WebHelper::dispatch(std::move(request), "POST", m_serverBase + "/api/request-host/feedback",
+        [callback = std::move(callback)](web::WebResponse response) mutable {
+            auto parsed = matjson::parse(response.string().unwrapOr(""));
+            std::string error = parsed ? parsed.unwrap()["error"].asString().unwrapOr("") : "";
+            if (callback) callback(response.ok(), error.empty() ? "No se pudo enviar el feedback" : error);
+        });
+    return true;
+}
+
+std::string WebRequestSource::savedToken() const {
+    auto token = Mod::get()->getSavedValue<std::string>(tokenKey(m_accountID), "");
+    if (token.empty()) token = Mod::get()->getSavedValue<std::string>(kLegacyTokenKey, "");
+    return token;
+}
+
+void WebRequestSource::registerHost() {
+    // the server checks the account against RobTop's servers, so send the
+    // name as is: it decides the URL one.
+    auto token = savedToken();
+    auto body = matjson::makeObject({
+        {"username", m_username},
+        {"accountID", m_accountID},
+    });
+    web::WebRequest request;
+    request.header("Content-Type", "application/json")
+        .header("X-API-Key", HttpClient::get().getApiKey())
+        .timeout(std::chrono::seconds(12))
+        .bodyString(body.dump(matjson::NO_INDENTATION));
+    if (!token.empty()) request.header("Authorization", "Bearer " + token);
+    // account ownership proof: with the saved token lost, the server only
+    // issues a new one when this proves the account is yours.
+    auto modCode = HttpClient::get().getModCode();
+    if (!modCode.empty()) request.header("X-Mod-Code", modCode);
+    auto viewerToken = HttpClient::get().getViewerToken();
+    if (!viewerToken.empty()) request.header("X-Viewer-Token", viewerToken);
+
+    std::weak_ptr<uint8_t> life = m_life;
+    WebHelper::dispatch(std::move(request), "POST", m_serverBase + "/api/request-host/register",
+        [this, life](web::WebResponse response) {
+            if (life.expired() || m_stopped || paimon::isRuntimeShuttingDown()) return;
+            auto parsed = matjson::parse(response.string().unwrapOr(""));
+            if (!response.ok() || !parsed) {
+                handleRegisterError(response.code(),
+                    parsed ? parsed.unwrap()["code"].asString().unwrapOr("") : std::string{});
+                return;
+            }
+            auto newToken = parsed.unwrap()["token"].asString().unwrapOr("");
+            if (newToken.size() < 32) {
+                fail("El servidor no entrego una sesion segura para requests");
+                return;
+            }
+            // the server sends the URL-ready user already cleaned.
+            auto slug = parsed.unwrap()["slug"].asString().unwrapOr("");
+            if (!slug.empty()) m_slug = std::move(slug);
+            Mod::get()->setSavedValue<std::string>(tokenKey(m_accountID), newToken);
+            paimon::requestDeferredModSave();
+            if (parsed.unwrap()["rotated"].asBool().unwrapOr(false)) {
+                log::info("[WebRequests] el servidor creo un acceso nuevo para la pagina");
+                if (m_callbacks.onStatus)
+                    m_callbacks.onStatus("Se creo un acceso nuevo para tu pagina; conectando...");
+            }
+            connectSocket(std::move(newToken));
+        });
+}
+
+// unknown token: drop it and re-ask with ownership proof; rotating without
+// it would brick the page.
+void WebRequestSource::handleRegisterError(int status, std::string code) {
+    if (code == "TOKEN_REQUIRED" && !m_retriedWithoutToken) {
+        m_retriedWithoutToken = true;
+        Mod::get()->setSavedValue<std::string>(tokenKey(m_accountID), std::string{});
+        Mod::get()->setSavedValue<std::string>(kLegacyTokenKey, std::string{});
+        paimon::requestDeferredModSave();
+        registerHost();
+        return;
+    }
+
+    std::string error = "No pudimos registrar tu pagina de requests";
+    if (code == "TOKEN_REQUIRED") {
+        error = "Esta pagina ya esta registrada en otro lugar; verifica tu cuenta de GD para crear un acceso nuevo";
+    } else if (code == "USERNAME_TAKEN") {
+        error = "Otra cuenta de GD ya registro esa direccion";
+    } else if (code == "ACCOUNT_MISMATCH" || code == "USERNAME_MISMATCH"
+        || code == "ACCOUNT_NOT_FOUND") {
+        error = "El servidor no pudo verificar tu cuenta de Geometry Dash";
+    } else if (code == "VERIFY_FAILED") {
+        error = "No se pudo comprobar tu cuenta; reintentando...";
+    } else if (code == "RATE_LIMITED") {
+        error = "Demasiados intentos seguidos; espera un momento";
+    } else if (code == "AUTH_FAILED" || status == 401) {
+        error = "El servidor rechazo la clave del mod";
+    } else if (status == 404) {
+        error = "El servidor todavia no tiene la pagina de requests";
+    }
+    fail(std::move(error));
+}
+
+void WebRequestSource::connectSocket(std::string token) {
+    auto target = parseServer(m_serverBase);
+    if (!target) {
+        fail("La direccion del servidor de requests no es valida");
+        return;
+    }
+    m_socket = std::make_unique<paimon::net::WebSocketClient>();
+    paimon::net::WebSocketClient::Options options;
+    options.host = std::move(target->host);
+    options.path = target->path + "/api/request-host/connect?username="
+        + HttpClient::encodeQueryParam(m_slug);
+    options.label = "Paimbnails Web Requests";
+    options.headers = {
+        {"X-API-Key", HttpClient::get().getApiKey()},
+        {"Authorization", "Bearer " + token},
+    };
+
+    std::weak_ptr<uint8_t> life = m_life;
+    bool started = m_socket->connect(
+        std::move(options),
+        [this, life] {
+            if (life.expired()) return;
+            m_open = true;
+            onMain([this] {
+                if (m_callbacks.onReady) m_callbacks.onReady(m_slug);
+            });
+        },
+        [this, life](std::string message) {
+            if (life.expired()) return;
+            onMain([this, message = std::move(message)]() mutable {
+                handleMessage(std::move(message));
+            });
+        },
+        [this, life](std::string error) {
+            if (life.expired()) return;
+            m_open = false;
+            onMain([this, error = std::move(error)]() mutable {
+                fail(error.empty() ? "La pagina de requests se desconecto" : std::move(error));
+            });
+        }
+    );
+    if (!started) fail("Web requests no esta disponible en esta plataforma");
+}
+
+void WebRequestSource::handleMessage(std::string message) {
+    if (m_stopped || !m_socket) return;
+    auto parsed = matjson::parse(message);
+    if (!parsed) return;
+    auto body = parsed.unwrap();
+    if (body["type"].asString().unwrapOr("") != "level-request") return;
+    auto requestID = body["requestId"].asString().unwrapOr("");
+    auto levelID = body["levelId"].asInt().unwrapOr(0);
+    if (requestID.empty() || levelID <= 0 || levelID > INT_MAX) return;
+
+    WebRequest incoming;
+    incoming.requestID = requestID;
+    incoming.requester = body["requester"].asString().unwrapOr("Web");
+    incoming.requesterVerified = body["requesterVerified"].asBool().unwrapOr(false);
+    incoming.requesterAccountID = static_cast<int>(std::clamp<int64_t>(body["requesterAccountID"].asInt().unwrapOr(0), 0, INT_MAX));
+    incoming.levelID = static_cast<int>(levelID);
+    incoming.message = body["message"].asString().unwrapOr("");
+    incoming.video = body["video"].asString().unwrapOr("");
+
+    std::string reason = m_callbacks.onRequest
+        ? m_callbacks.onRequest(std::move(incoming))
+        : "disabled";
+    auto reply = matjson::makeObject({
+        {"type", "request-result"},
+        {"requestId", requestID},
+        {"accepted", reason.empty()},
+        {"reason", reason},
+    });
+    m_socket->send(reply.dump(matjson::NO_INDENTATION));
+}
+
+void WebRequestSource::fail(std::string error) {
+    if (m_stopped) return;
+    m_open = false;
+    if (m_callbacks.onError) m_callbacks.onError(std::move(error));
+}
+
+void WebRequestSource::onMain(std::function<void()> work) {
+    std::weak_ptr<uint8_t> life = m_life;
+    Loader::get()->queueInMainThread([life, work = std::move(work)]() mutable {
+        if (life.expired() || paimon::isRuntimeShuttingDown()) return;
+        work();
+    });
+}
+
+} // namespace paimon::twitch

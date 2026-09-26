@@ -1,0 +1,34 @@
+#pragma once
+
+#include <Geode/Geode.hpp>
+
+#include "../services/BeatShaderManager.hpp"
+
+#include <vector>
+#include <string>
+
+namespace paimon::beat_shaders {
+
+class BeatShaderConfigLayer : public geode::Popup {
+public:
+    static BeatShaderConfigLayer* create();
+
+protected:
+    bool init() override;
+
+    void rebuild();
+    void scheduleRebuild();
+    void persistAndRefresh(bool shaderChanged);
+
+private:
+    BeatShaderConfig m_cfg;
+    std::vector<BeatShaderManager::ShaderEntry> m_shaders;
+    int m_shaderIdx = 0;
+    std::vector<std::string> m_layerKeys;
+    int m_tab = 0; // 0 = Basico, 1 = Avanzado
+
+    geode::ScrollLayer* m_scroll = nullptr;
+    cocos2d::CCLabelBMFont* m_shaderDescLabel = nullptr;
+};
+
+} // namespace paimon::beat_shaders

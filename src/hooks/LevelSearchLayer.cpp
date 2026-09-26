@@ -1,0 +1,339 @@
+#include <Geode/Geode.hpp>
+#include <Geode/modify/LevelSearchLayer.hpp>
+#include "../framework/HookConventions.hpp"
+#include "../core/modules/ModuleRegistry.hpp"
+#include "../features/community/ui/LeaderboardLayer.hpp"
+#include "../features/backgrounds/services/LayerBackgroundManager.hpp"
+#include "../features/transitions/services/TransitionManager.hpp"
+#include "../utils/SpriteHelper.hpp"
+#include "../utils/ScissorClipNode.hpp"
+#include "../utils/PaimonDrawNode.hpp"
+#include "LevelCellContext.hpp"
+#include "../framework/compat/SceneLocators.hpp"
+#include "../core/RuntimeLifecycle.hpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include "../features/level-search/services/LevelSearchHelpers.hpp"
+#include "../features/level-search/services/SearchRequestCoordinator.hpp"
+#include "../features/level-search/services/LevelSearchInternal.hpp"
+
+using namespace geode::prelude;
+using namespace paimon::levelsearch;
+
+class $modify(MyLevelSearchLayer, LevelSearchLayer) {
+    static void onModify(auto& self) {
+        paimon::hooks::afterNodeIdsOrLate(self, "LevelSearchLayer::init");
+    }
+
+    struct Fields {
+        bool m_previewCallbacksSuspended = false;
+    };
+
+    CCNode* getRealtimePreviewNodeSafe() {
+        if (m_fields->m_previewCallbacksSuspended || paimon::isRuntimeShuttingDown()) {
+            return nullptr;
+        }
+        return this->getChildByID("paimon-realtime-search-preview"_spr);
+    }
+
+    bool init(int type) {
+        if (!LevelSearchLayer::init(type)) return false;
+        m_fields->m_previewCallbacksSuspended = false;
+
+        bool hasCustomBg = LayerBackgroundManager::get().applyBackground(this, "search");
+
+        // with a custom bg, hide GD's decorative sprites
+        if (hasCustomBg) {
+            static char const* hideIDs[] = {
+                "level-search-bg",
+                "quick-search-bg",
+                "difficulty-filters-bg",
+                "length-filters-bg",
+                nullptr
+            };
+            for (int i = 0; hideIDs[i]; i++) {
+                if (auto node = this->getChildByID(hideIDs[i])) {
+                    node->setVisible(false);
+                }
+            }
+        }
+
+        CCSprite* spr = CCSprite::createWithSpriteFrameName("GJ_starBtn_001.png");
+        if (!paimon::SpriteHelper::isValidSprite(spr)) {
+            spr = CCSprite::create("paim_Daily.png"_spr);
+            if (!paimon::SpriteHelper::isValidSprite(spr)) {
+                spr = paimon::SpriteHelper::safeCreateWithFrameName("GJ_bigStar_001.png");
+            }
+        }
+        if (!paimon::SpriteHelper::isValidSprite(spr)) {
+            log::warn("Could not create leaderboard button sprite in LevelSearchLayer");
+            return true;
+        }
+
+        float targetSize = 35.0f;
+        float currentSize = std::max(spr->getContentWidth(), spr->getContentHeight());
+        if (currentSize > 0) spr->setScale(targetSize / currentSize);
+
+        auto btn = CCMenuItemSpriteExtra::create(
+            spr,
+            this,
+            menu_selector(MyLevelSearchLayer::onLeaderboard)
+        );
+        btn->setID("paimon-leaderboard-btn"_spr);
+
+        if (auto menu = this->getChildByID("other-filter-menu")) {
+            menu->addChild(btn);
+            menu->updateLayout();
+        } else if (auto fallbackMenu = paimon::compat::LevelBrowserLocator::findSearchMenu(this)) {
+            fallbackMenu->addChild(btn);
+            fallbackMenu->updateLayout();
+            log::warn("Using fallback menu locator in LevelSearchLayer");
+        } else {
+            log::warn("Could not find 'other-filter-menu' nor fallback menu in LevelSearchLayer");
+        }
+
+        if (kEnableRealtimeSearchPreview() && supportsRealtimePreviewUI()) {
+            if (auto preview = RealtimeSearchBrowserPreview::create(this)) {
+                this->addChild(preview, 30);
+            }
+        }
+
+        addEventListener(KeybindSettingPressedEventV3(Mod::get(), "level-search-enter"), [this](
+            Keybind const&,
+            bool down,
+            bool repeat,
+            double
+        ) {
+            auto scene = CCDirector::get()->getRunningScene();
+            if (!down || repeat || !scene || !this->isRunning()) return;
+            if (!paimon::modules::isEnabled("paimbnails.quicksearch.browser")) return;
+            if (!scene->getChildByID("LevelSearchLayer")) return;
+            this->onSearch(nullptr);
+        });
+
+        return true;
+    }
+
+    $override
+    void onExit() {
+        m_fields->m_previewCallbacksSuspended = true;
+        LevelSearchLayer::onExit();
+        releaseSearchInputFocus(this);
+    }
+
+    $override
+    void onEnter() {
+        LevelSearchLayer::onEnter();
+        m_fields->m_previewCallbacksSuspended = false;
+
+        // recreate the realtime preview destroyed in transition (normal tab only)
+        if (kEnableRealtimeSearchPreview() && !hasRealtimePreview() && supportsRealtimePreviewUI()) {
+            if (auto searchInput = typeinfo_cast<CCTextInputNode*>(this->getChildByID("search-input"))) {
+                // 0 = normal search, 1 = list search (from the tab buttons)
+                auto* tabMenu = this->getChildByID("tab-menu");
+                auto* listBtn = tabMenu ? tabMenu->getChildByID("list-search-btn") : nullptr;
+                auto* listBtnItem = listBtn ? typeinfo_cast<CCMenuItemToggler*>(listBtn) : nullptr;
+                if (!listBtnItem || !listBtnItem->isToggled()) {
+                    if (auto preview = RealtimeSearchBrowserPreview::create(this)) {
+                        this->addChild(preview, 30);
+                    }
+                }
+            }
+        }
+    }
+
+    $override
+    void cleanup() {
+        m_fields->m_previewCallbacksSuspended = true;
+        // replaceScene() fires cleanup() mid-transition; onEnter() re-activates after
+        LevelSearchLayer::cleanup();
+    }
+
+    bool hasRealtimePreview() {
+        return getRealtimePreviewNodeSafe() != nullptr;
+    }
+
+    bool supportsRealtimePreviewUI() {
+        return this->getChildByID("quick-search-menu") != nullptr
+            && this->getChildByID("quick-search-bg") != nullptr;
+    }
+
+    void destroyRealtimePreviewNow() {
+        // grab before suspending: the safe getter returns null once suspended
+        auto* node = this->getChildByID("paimon-realtime-search-preview"_spr);
+
+        m_fields->m_previewCallbacksSuspended = true;
+        releaseSearchInputFocus(this);
+
+        if (auto preview = typeinfo_cast<RealtimeSearchBrowserPreview*>(node)) {
+            preview->shutdown(true);
+            preview->removeFromParentAndCleanup(true);
+        }
+    }
+
+    $override
+    void textChanged(CCTextInputNode* node) {
+        LevelSearchLayer::textChanged(node);
+
+        if (m_fields->m_previewCallbacksSuspended || paimon::isRuntimeShuttingDown()) return;
+
+        if (auto preview = typeinfo_cast<RealtimeSearchBrowserPreview*>(
+            getRealtimePreviewNodeSafe()
+        )) {
+            preview->handleTextChanged(node);
+        }
+    }
+
+    void refreshRealtimePreview(bool force) {
+        if (m_fields->m_previewCallbacksSuspended || paimon::isRuntimeShuttingDown()) return;
+
+        if (auto preview = typeinfo_cast<RealtimeSearchBrowserPreview*>(
+            getRealtimePreviewNodeSafe()
+        )) {
+            preview->refreshFromCurrentInput(force);
+        }
+    }
+
+    $override
+    void toggleDifficulty(CCObject* sender) {
+        LevelSearchLayer::toggleDifficulty(sender);
+        refreshRealtimePreview(true);
+    }
+
+    $override
+    void toggleTime(CCObject* sender) {
+        LevelSearchLayer::toggleTime(sender);
+        refreshRealtimePreview(true);
+    }
+
+    $override
+    void toggleStar(CCObject* sender) {
+        LevelSearchLayer::toggleStar(sender);
+        refreshRealtimePreview(true);
+    }
+
+    $override
+    void demonFilterSelectClosed(int filter) {
+        LevelSearchLayer::demonFilterSelectClosed(filter);
+        refreshRealtimePreview(true);
+    }
+
+    $override
+    void clearFilters() {
+        LevelSearchLayer::clearFilters();
+        refreshRealtimePreview(true);
+    }
+
+    $override
+    void enterPressed(CCTextInputNode* node) {
+        if (hasRealtimePreview() && node == m_searchInput && !trimQuery(node->getString()).empty()) {
+            destroyRealtimePreviewNow();
+            this->onSearch(nullptr);
+            return;
+        }
+        LevelSearchLayer::enterPressed(node);
+    }
+
+    $override
+    void keyBackClicked() {
+        destroyRealtimePreviewNow();
+        // leaving search entirely; release the cached result pages
+        paimon::levelsearch::SearchRequestCoordinator::get().reset();
+        LevelSearchLayer::keyBackClicked();
+    }
+
+    $override
+    void onBack(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        paimon::levelsearch::SearchRequestCoordinator::get().reset();
+        LevelSearchLayer::onBack(sender);
+    }
+
+    $override
+    void onSearch(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onSearch(sender);
+    }
+
+    $override
+    void onSearchMode(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onSearchMode(sender);
+    }
+
+    $override
+    void onSearchUser(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onSearchUser(sender);
+    }
+
+    $override
+    void onMostDownloaded(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onMostDownloaded(sender);
+    }
+
+    $override
+    void onMostLikes(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onMostLikes(sender);
+    }
+
+    $override
+    void onSuggested(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onSuggested(sender);
+    }
+
+    $override
+    void onTrending(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onTrending(sender);
+    }
+
+    $override
+    void onMagic(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onMagic(sender);
+    }
+
+    $override
+    void onMostRecent(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onMostRecent(sender);
+    }
+
+    $override
+    void onLatestStars(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onLatestStars(sender);
+    }
+
+    $override
+    void onFriends(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onFriends(sender);
+    }
+
+    $override
+    void onFollowed(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onFollowed(sender);
+    }
+
+    $override
+    void onStarAward(CCObject* sender) {
+        destroyRealtimePreviewNow();
+        LevelSearchLayer::onStarAward(sender);
+    }
+
+    void onLeaderboard(CCObject*) {
+        destroyRealtimePreviewNow();
+        TransitionManager::get().replaceScene(LeaderboardLayer::scene(LeaderboardLayer::BackTarget::LevelSearchLayer));
+    }
+};
